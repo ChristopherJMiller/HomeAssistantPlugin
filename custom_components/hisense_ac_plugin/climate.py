@@ -47,6 +47,25 @@ from .devices import get_device_parser
 
 _LOGGER = logging.getLogger(__name__)
 
+# Fan speed descriptions come as "低", "低风" ("low wind"), "Low", ...: one exact
+# mapping (after dropping a trailing 风) for setup, the getter and the setter, so
+# fan modes are Home Assistant's names, never raw labels, and "低" (low) cannot
+# match "超低风" (ultra low) by substring.
+_FAN_DESC_TO_MODE = {
+    "自动": FAN_AUTO, "auto": FAN_AUTO,
+    "超低": SFAN_ULTRA_LOW, "ultra low": SFAN_ULTRA_LOW,
+    "低": FAN_LOW, "low": FAN_LOW,
+    "中": FAN_MEDIUM, "medium": FAN_MEDIUM, "med": FAN_MEDIUM,
+    "高": FAN_HIGH, "high": FAN_HIGH,
+    "超高": SFAN_ULTRA_HIGH, "ultra high": SFAN_ULTRA_HIGH,
+}
+
+
+def _fan_mode_from_desc(desc: str) -> str:
+    """Map a device fan speed description to a fan mode (the description if unknown)."""
+    key = desc.strip().removesuffix("风").strip().lower()
+    return _FAN_DESC_TO_MODE.get(key, desc)
+
 # Standard mappings for Home Assistant HVAC modes
 HA_MODE_TO_STR = {
     HVACMode.AUTO: "auto",
@@ -295,23 +314,10 @@ class HisenseClimate(CoordinatorEntity, ClimateEntity):
         fan_speed_attr = self._parser.attributes.get(StatusKey.FAN_SPEED)
         if fan_speed_attr and fan_speed_attr.value_map:
             for key, value in fan_speed_attr.value_map.items():
-                # Map Chinese descriptions to standard fan modes
-                if "自动" == value or "auto" == value.lower():
-                    fan_modes.append(FAN_AUTO)
+                mode = _fan_mode_from_desc(value)
+                fan_modes.append(mode)
+                if mode == FAN_AUTO:
                     self.hasAuto = True
-                elif "超低" == value or "ultra low" == value.lower():
-                    fan_modes.append(SFAN_ULTRA_LOW)
-                elif "低" == value or "low" == value.lower():
-                    fan_modes.append(FAN_LOW)
-                elif "中" == value or "medium" == value.lower() or "med" == value.lower():
-                    fan_modes.append(FAN_MEDIUM)
-                elif "高" == value or "high" == value.lower():
-                    fan_modes.append(FAN_HIGH)
-                elif "超高" == value or "ultra high" == value.lower():
-                    fan_modes.append(SFAN_ULTRA_HIGH)
-                else:
-                    # Use the Chinese description as the mode name
-                    fan_modes.append(value)
 
         if fan_modes:
             # 新增逻辑：检查条件并过滤模式
@@ -473,23 +479,7 @@ class HisenseClimate(CoordinatorEntity, ClimateEntity):
             if fan_attr and fan_attr.value_map and fan_mode in fan_attr.value_map:
                 fan_desc = fan_attr.value_map[fan_mode]
                 _LOGGER.debug("Fan mode %s maps to fan: %s", fan_mode, fan_desc)
-
-                # Map to standard fan modes based on description
-                if "自动" == fan_desc or "auto" == fan_desc.lower():
-                    return FAN_AUTO
-                elif "超低" == fan_desc or "ultra low" == fan_desc.lower():
-                    return SFAN_ULTRA_LOW
-                elif "低" == fan_desc or "low" == fan_desc.lower():
-                    return FAN_LOW
-                elif "中" == fan_desc or "medium" == fan_desc.lower() or "med" == fan_desc.lower():
-                    return FAN_MEDIUM
-                elif "高" == fan_desc or "high" == fan_desc.lower():
-                    return FAN_HIGH
-                elif "超高" == fan_desc or "ultra high" == fan_desc.lower():
-                    return SFAN_ULTRA_HIGH
-                else:
-                    # Use the Chinese description as the mode name
-                    return fan_desc
+                return _fan_mode_from_desc(fan_desc)
 
         # Fallback to the raw value
         return fan_mode
@@ -680,26 +670,8 @@ class HisenseClimate(CoordinatorEntity, ClimateEntity):
                 fan_attr = self._parser.attributes.get(StatusKey.FAN_SPEED)
                 if fan_attr and fan_attr.value_map:
                     for key, value in fan_attr.value_map.items():
-                        if fan_mode == FAN_AUTO and ("自动" in value or "auto" in value.lower()):
-                            hisense_fan_mode = key
-                            break
-                        elif fan_mode == FAN_LOW and ("低" in value or "low" in value.lower()):
-                            hisense_fan_mode = key
-                            break
-                        elif fan_mode == FAN_MEDIUM and ("中" in value or "medium" in value.lower() or "med" in value.lower()):
-                            hisense_fan_mode = key
-                            break
-                        elif fan_mode == FAN_HIGH and ("高" in value or "high" in value.lower()):
-                            hisense_fan_mode = key
-                            break
-                        elif fan_mode == FAN_ULTRA_LOW and ("超低" in value or "ultra low" in value.lower()):
-                            hisense_fan_mode = key
-                            break
-                        elif fan_mode == FAN_ULTRA_HIGH and ("超高" in value or "ultra high" in value.lower()):
-                            hisense_fan_mode = key
-                            break
-                        elif fan_mode == value:
-                            # Direct match with the description
+                        # Same mapping as the getter; a raw description still matches.
+                        if fan_mode in (_fan_mode_from_desc(value), value):
                             hisense_fan_mode = key
                             break
 

@@ -12,7 +12,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
-from homeassistant.helpers.event import async_track_state_change_event
+from homeassistant.helpers.event import async_call_later, async_track_state_change_event
 from homeassistant.core import Event
 from homeassistant.helpers.dispatcher import callback
 
@@ -269,7 +269,9 @@ class HisenseSwitch(CoordinatorEntity, SwitchEntity):
 
     async def _async_schedule_update(self):
         """异步调度更新实体状态。"""
-        await self.async_schedule_update_ha_state(True)
+        # async_schedule_update_ha_state is a callback, not a coroutine: awaiting
+        # its None raised TypeError on every device state change.
+        self.async_schedule_update_ha_state(True)
 
     # def _update_entity_name(self):
     #     """根据设备状态动态更新实体名称。"""
@@ -464,11 +466,13 @@ class HisenseSwitch(CoordinatorEntity, SwitchEntity):
             _LOGGER.info("防跳变时间窗口内，延后更新状态")
             # 计算剩余时间
             remaining_time = self._debounce_delay - (current_time - self._last_action_time)
-            # 延后触发更新
-            self.hass.helpers.dispatcher.async_dispatcher_send(
-                f"{DOMAIN}_switch_update_{self.entity_id}",
-                remaining_time
-            )
+            # 延后触发更新: hass.helpers is gone from Home Assistant (and nothing
+            # listened for that signal), so update once the window has passed.
+            async_call_later(self.hass, remaining_time, self._async_update_after_debounce)
         else:
-            # 正常更新状态
-            await self.async_schedule_update_ha_state(True)
+            # 正常更新状态 (a callback, not a coroutine: do not await it)
+            self.async_schedule_update_ha_state(True)
+
+    @callback
+    def _async_update_after_debounce(self, _now) -> None:
+        self.async_schedule_update_ha_state(True)
