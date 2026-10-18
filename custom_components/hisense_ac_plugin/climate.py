@@ -207,6 +207,8 @@ class HisenseClimate(CoordinatorEntity, ClimateEntity):
         else:
             _LOGGER.warning("Target temperature attribute or value range not found, using default range.")
             temperature_ranges = [(MIN_TEMP, MAX_TEMP)]
+        # Kept for the live unit below: [0] is the °C range, [1] the °F range.
+        self._temperature_ranges = temperature_ranges
 
         # 获取 temp_type 属性
         temp_type_attr = device.status.get(StatusKey.T_TEMP_TYPE)
@@ -365,6 +367,33 @@ class HisenseClimate(CoordinatorEntity, ClimateEntity):
         if device:
             _LOGGER.debug("Retrieved device %s with status: %s", self._device_id, device.status)
         return device
+
+    # The unit can be switched between °C and °F at any time (its panel, an IR
+    # remote, the app), and every temperature it reports or accepts is then in
+    # that unit. Follow t_temp_type live, not only at setup, so Home Assistant
+    # converts correctly instead of reading Celsius under a Fahrenheit label.
+    @property
+    def _is_fahrenheit(self) -> bool:
+        device = self.coordinator.get_device(self._device_id)
+        return bool(device) and device.status.get(StatusKey.T_TEMP_TYPE) == "1"
+
+    def _temperature_range(self) -> tuple[float, float]:
+        ranges = getattr(self, "_temperature_ranges", None) or [(MIN_TEMP, MAX_TEMP)]
+        if self._is_fahrenheit:
+            return ranges[1] if len(ranges) > 1 else (MIN_TEMP, MAX_TEMP)
+        return ranges[0]
+
+    @property
+    def temperature_unit(self) -> str:
+        return UnitOfTemperature.FAHRENHEIT if self._is_fahrenheit else UnitOfTemperature.CELSIUS
+
+    @property
+    def min_temp(self) -> float:
+        return self._temperature_range()[0]
+
+    @property
+    def max_temp(self) -> float:
+        return self._temperature_range()[1]
 
     @property
     def available(self) -> bool:
@@ -549,11 +578,16 @@ class HisenseClimate(CoordinatorEntity, ClimateEntity):
         _LOGGER.debug("温度下发: %s: %s", kwargs,temperature)
         if temperature is None:
             return
+        # Home Assistant hands over a converted float (72 °F for a °C unit is
+        # 22.222…): round to the unit's step and send "22", not "22.2222222".
+        step = self.target_temperature_step or 1
+        temperature = round(float(temperature) / step) * step
+        value = str(int(temperature)) if float(temperature).is_integer() else str(temperature)
 
         try:
             await self.coordinator.async_control_device(
                 puid=self._device_id,
-                properties={StatusKey.TARGET_TEMP: str(temperature)},
+                properties={StatusKey.TARGET_TEMP: value},
             )
         except Exception as err:
             _LOGGER.error("Failed to set temperature: %s", err)
