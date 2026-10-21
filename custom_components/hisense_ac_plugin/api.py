@@ -16,6 +16,7 @@ import hmac
 import aiohttp
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.update_coordinator import UpdateFailed
 
 from .const import (
     API_BASE_URL,
@@ -28,6 +29,7 @@ from .const import (
     CLIENT_SECRET,
     DeviceType,
     DEVICE_TYPES, DOMAIN, API_GET_HOUR_POWER, API_SELF_CHECK,
+    SLOW_POLL_INTERVAL,
 )
 from .devices.base import DeviceAttribute
 from .oauth2 import OAuth2Session
@@ -54,6 +56,12 @@ class HisenseApiClient:
         self._devices: dict[str, DeviceInfo] = {}
         self.parsers: dict[str, BaseDeviceParser] = {}
         self.static_data: dict[str, Any] = {}
+        # (deviceTypeCode, deviceFeatureCode) -> property list; it never changes.
+        self._property_lists: dict[tuple[str, str], list] = {}
+        # device_id -> (monotonic time of the last attempt, failed status keys)
+        self._self_checks: dict[str, tuple[float, list[str] | None]] = {}
+        # device_id -> (monotonic time of the last attempt, "date hour", value)
+        self._hour_power: dict[str, tuple[float, str, Any]] = {}
         self._status_callbacks: dict[str, Callable[[dict[str, Any]], None]] = {}
         self._websocket: HisenseWebSocket | None = None
         self._source_id: str | None = None
@@ -504,13 +512,16 @@ class HisenseApiClient:
                             device.debug_info()
                         )
 
-                        response = await self.async_get_property_list(deviceTypeCode,deviceFeatureCode)
-                        if "99" in deviceFeatureCode:
+                        property_key = (deviceTypeCode, deviceFeatureCode)
+                        if property_key not in self._property_lists:
+                            response = await self.async_get_property_list(deviceTypeCode,deviceFeatureCode)
+                            self._property_lists[property_key] = response.get("status")
+                        if "99" in deviceFeatureCode and device.device_id not in self.static_data:
                             re = await self.async_query_static_data(device.puid)
                             _LOGGER.debug("Static data for re %s: %s", deviceFeatureCode,
                                           re)
                             self.static_data[device.device_id] = re.get("status")
-                        propertyList = response.get("status")
+                        propertyList = self._property_lists[property_key]
                         _LOGGER.debug("Static data for propertyList %s: %s", deviceFeatureCode,
                                       propertyList)
 
@@ -608,17 +619,31 @@ class HisenseApiClient:
 
                         if has_power:
                             current_date = datetime.now().date().isoformat()
-                            power_response = await self.async_get_hour_power(current_date, device.puid)
-                            power = power_response.get("status")
                             current_time = datetime.now()
                             previous_hour = (current_time - timedelta(hours=1)).hour
                             previous_hour_str = str(previous_hour)
-                            value = power.get(previous_hour_str)
-                            _LOGGER.debug("Static data for power_response %s: %s ，当前时间：%s ，上个小时的时间：%s ，上个小时的电量：%s", deviceFeatureCode,
-                                          power_response, current_time.hour,previous_hour_str, value)
+                            # Fetched when the hour turns over, then every SLOW_POLL_INTERVAL
+                            # (the last hour's figure can still settle); a failure keeps
+                            # the last value and waits for the next slow tick.
+                            hour_key = f"{current_date} {previous_hour_str}"
+                            cached = self._hour_power.get(device.device_id)
+                            if (cached is None or cached[1] != hour_key
+                                    or time.monotonic() - cached[0] >= SLOW_POLL_INTERVAL):
+                                value = cached[2] if cached and cached[1] == hour_key else None
+                                try:
+                                    power_response = await self.async_get_hour_power(current_date, device.puid)
+                                    power = power_response.get("status")
+                                    value = power.get(previous_hour_str)
+                                    _LOGGER.debug("Static data for power_response %s: %s ，当前时间：%s ，上个小时的时间：%s ，上个小时的电量：%s", deviceFeatureCode,
+                                                  power_response, current_time.hour,previous_hour_str, value)
+                                except HisenseApiError as err:
+                                    _LOGGER.warning("Hourly power for %s failed, keeping the last value: %s",
+                                                    device.device_id, err)
+                                cached = (time.monotonic(), hour_key, value)
+                                self._hour_power[device.device_id] = cached
                             _LOGGER.debug("Static data for device.status %s: %s", deviceFeatureCode,
                                           device.status)
-                            device.status["f_power_consumption"] = value
+                            device.status["f_power_consumption"] = cached[2]
                             _LOGGER.debug("Static data for f_power_consumption %s: %s", deviceFeatureCode,
                                           device.status)
                         else:
@@ -626,20 +651,26 @@ class HisenseApiClient:
                         _LOGGER.debug("Static data for device.status %s: %s", deviceFeatureCode,
                                           device.status)
                         #填充故障列表
-                        data = await self.async_api_self_check("1", device.puid)
-                        failed_data = data.get("status", {}).get("selfCheckFailedList")
-                        _LOGGER.debug(
-                            "Static data for self_check %s: 完整自检数据 %s: 单纯故障数据 %s",
-                            deviceFeatureCode,
-                            data, failed_data)
-                        if failed_data:
-                            failed_list = [item.get("statusKey") for item in failed_data]
-                            # self.failed_data[device.device_id] = failed_list
-                            device.failed_data = failed_list
-                            _LOGGER.debug(
-                                "Static data for failed_list %s: 完整自检数据 %s: 单纯故障数据 %s: 取出所有的key %s",
-                                deviceFeatureCode,
-                                data, failed_data, failed_list)
+                        # Refreshed every SLOW_POLL_INTERVAL; a failure keeps the last
+                        # list and waits for the next slow tick.
+                        cached = self._self_checks.get(device.device_id)
+                        if cached is None or time.monotonic() - cached[0] >= SLOW_POLL_INTERVAL:
+                            failed_list = cached[1] if cached else None
+                            try:
+                                data = await self.async_api_self_check("1", device.puid)
+                                failed_data = data.get("status", {}).get("selfCheckFailedList")
+                                _LOGGER.debug(
+                                    "Static data for self_check %s: 完整自检数据 %s: 单纯故障数据 %s",
+                                    deviceFeatureCode,
+                                    data, failed_data)
+                                failed_list = [item.get("statusKey") for item in failed_data] if failed_data else None
+                            except HisenseApiError as err:
+                                _LOGGER.warning("Self-check for %s failed, keeping the last result: %s",
+                                                device.device_id, err)
+                            cached = (time.monotonic(), failed_list)
+                            self._self_checks[device.device_id] = cached
+                        if cached[1]:
+                            device.failed_data = cached[1]
                     else:
                         _LOGGER.warning(
                             "Skipping unsupported device type:\n%s",

@@ -10,7 +10,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import HisenseApiClient, DeviceInfo
-from .const import UPDATE_INTERVAL
+from .const import MAX_UPDATE_INTERVAL, UPDATE_INTERVAL
 from .websocket import HisenseWebSocket
 
 _LOGGER = logging.getLogger(__name__)
@@ -83,12 +83,22 @@ class HisenseACPluginDataUpdateCoordinator(DataUpdateCoordinator):
             self._devices = devices
             self.data = devices
             _LOGGER.info("Successfully updated %d devices", len(devices))
-            
+            self._set_interval(UPDATE_INTERVAL)
+
             return self._devices
-            
+
         except Exception as error:
             _LOGGER.error("Error updating device data: %s", error)
+            # Back off while the cloud is failing (2x per failure, capped), so an
+            # outage on their side isn't met with a poll every 30 s.
+            self._set_interval(min(self.update_interval.total_seconds() * 2, MAX_UPDATE_INTERVAL))
             raise UpdateFailed(f"Error communicating with API: {error}")
+
+    def _set_interval(self, seconds: float) -> None:
+        """Set the poll interval, logging when it changes."""
+        if self.update_interval.total_seconds() != seconds:
+            _LOGGER.warning("Polling ConnectLife every %d s", seconds)
+            self.update_interval = timedelta(seconds=seconds)
 
     async def async_refresh_device(self, device_id: str) -> None:
         """Manually refresh a specific device's status."""

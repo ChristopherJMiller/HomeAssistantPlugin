@@ -68,6 +68,11 @@ TOKEN_EXPIRY_MARGIN = 60  # seconds before token expiry to refresh
 
 # Update interval
 UPDATE_INTERVAL = 30  # seconds
+# Each failed update doubles the interval, up to this; a success resets it.
+MAX_UPDATE_INTERVAL = 300  # seconds
+# The self-check (fault list) and hourly power are refreshed this often, not on
+# every status poll; a device's property list and static data are fetched once.
+SLOW_POLL_INTERVAL = 900  # seconds
 
 # Temperature settings
 MIN_TEMP = 16
